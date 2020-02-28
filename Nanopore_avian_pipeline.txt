@@ -1,0 +1,107 @@
+############
+############
+############
+XENOPS
+############
+############
+############
+
+#run flye
+sbatch -p highmem -t 0-48 --mem 360 -c 72 --mail-type=END,FAIL --mail-user wileyg@omrf.org -J flye_xenops --wrap "flye --nano-raw ./all_xenops_reads.fastq.gz --out-dir flye_out_all --genome-size 1.4g --threads 72"
+
+#run the racon polishing script
+sbatch -p gpu --gres gpu:2 --cpus-per-task 46 --mem 184 --mail-type=END,FAIL --mail-user wileyg@omrf.org -J xenops_racon --wrap "./4x_racon_polish.sh"
+
+# run medaka to see if it does any better
+sbatch -p gpu --gres gpu:2 --cpus-per-task 46 --mem 184 --mail-type=END,FAIL --mail-user wileyg@omrf.org -J xenops_medaka --wrap "medaka_consensus -i ../all_xenops_reads.fastq.gz -d ./assembly.racon4.fasta -o medaka_dir -t 46 -m r941_min_high_g303"
+
+#################pilon####################
+#get us a node to work on
+srun -p highmem --cpus-per-task 72 --mem=360 --constraint skylake -t 3:0:0 --pty /bin/bash -l
+
+#a quick map of the illumina reads to the racon polished contigs/scaffolds
+minimap2 -d ./consensus.fasta.mmi ./consensus.fasta
+minimap2 -t 66 -ax sr ../racon_polish/assembly.racon4.fasta  ../illumina_reads/xeno_MJM2051_S45_R1_trim.fastq.gz   ../illumina_reads/xeno_MJM2051_S45_R2_trim.fastq.gz  | samtools sort -@6 -o aln_illumina_sorted.bam -T tmp.ali
+samtools index -@ 70 aln_illumina_sorted.bam
+
+#bust up the racon contigs into individual fasta files 
+mkdir by_chr
+cd by_chr
+all2many ../../racon_polish/assembly.racon4.fasta 1
+
+#java needs more memory on these nodes than the default setting
+export JAVA_MEM_OPTS="-Xmx48G" 
+
+
+srun -p serial --cpus-per-task 4 --mem=16 --constraint skylake -t 3:0:0 --pty /bin/bash -l #after relinquishing the high mem node we need to get on a more modest node to do our work
+for name in `ls -d *_* | cat` #this will take all the busted-up fasta files from all2many....
+do
+echo "$name "
+mv ${name} ${name}.fasta #...put a file type ending on the file name
+mkdir ${name}  #make a directory for that fasta
+mv ${name}.fasta ${name}    #stick the fasta in that new directory                                                                                                                                                                                                                                                                                                                                                   
+samtools view -b -h -@ 3 ../aln_illumina_sorted.bam ${name} > ./${name}/${name}.bam #pull out the aligned reads for that contig
+samtools index -@ 3 ./${name}/${name}.bam #index them
+cd ./${name} #go into that directory
+sbatch -p serial -t 0-48 --mem 48 -c 10 -J pilon_${name} --wrap "pilon --threads 10 --genome ./${name}.fasta --bam ./${name}.bam --output ${name}.polished" #kick off a pilon job for that contig
+cd .. #come out of the directory
+sleep 1 #wait 1 second between jobs so we don't overwhelm the system
+done
+
+#some jobs fail. Once we figure out which of those failed we make a list and then restart them after removing the detritus of failure
+for name in `cat missed.txt`
+do
+rm ./${name}/${name}.bam*
+samtools view -b -h -@ 3 ../aln_illumina_sorted.bam ${name} > ./${name}/${name}.bam
+samtools index -@ 3 ./${name}/${name}.bam
+cd ./${name}
+rm slurm-*
+sbatch -p serial -t 0-48 --mem 48 -c 10 -J pilon_${name} --wrap "pilon --threads 10 --genome ./${name}.fasta --bam ./${name}.bam --output ${name}.polished"
+cd ..
+
+#combine all the pilons back together
+cat ./*_*/*.polished.fasta > all_pilon1_polished.fasta
+
+#################pilon2####################
+#same as pilon1, but different files to start us off
+srun -p highmem --cpus-per-task 72 --mem=360 --constraint skylake -t 3:0:0 --pty /bin/bash -l
+
+minimap2 -d ../pilon_dir/by_chr/all_pilon1_polished.fasta.mmi ../pilon_dir/by_chr/all_pilon1_polished.fasta
+minimap2 -t 66 -ax sr ../pilon_dir/by_chr/all_pilon1_polished.fasta ../illumina_reads/xeno_MJM2051_S45_R1_trim.fastq.gz   ../illumina_reads/xeno_MJM2051_S45_R2_trim.fastq.gz  | samtools sort -@ 6 -o aln_illumina_sorted.bam -T tmp.ali 
+samtools index -@ 70 aln_illumina_sorted.bam
+
+mkdir by_chr
+cd by_chr
+all2many ../../pilon_dir/by_chr/all_pilon1_polished.fasta 1
+
+export JAVA_MEM_OPTS="-Xmx48G" 
+
+srun -p serial --cpus-per-task 4 --mem=16 --constraint skylake -t 3:0:0 --pty /bin/bash -l
+for name in `ls -d *_* | cat`
+do
+echo "$name "
+mv ${name} ${name}.fasta
+mkdir ${name}
+mv ${name}.fasta ${name}
+samtools view -b -h -@ 3 ../aln_illumina_sorted.bam ${name} > ./${name}/${name}.bam
+samtools index -@ 3 ./${name}/${name}.bam
+cd ./${name}
+sbatch -p serial -t 0-48 --mem 48 -c 10 -J pilon_${name} --wrap "pilon --threads 10 --genome ./${name}.fasta --bam ./${name}.bam --output ${name}.polished"
+cd ..
+sleep 1
+done
+
+for name in `cat missing.txt`
+do
+rm ./${name}/${name}.bam*
+samtools view -b -h -@ 3 ../aln_illumina_sorted.bam ${name} > ./${name}/${name}.bam
+samtools index -@ 3 ./${name}/${name}.bam
+cd ./${name}
+rm slurm-*
+sbatch -p serial -t 0-48 --mem 48 -c 10 -J pilon_${name} --wrap "pilon --threads 10 --genome ./${name}.fasta --bam ./${name}.bam --output ${name}.polished"
+cd ..
+
+#################busco####################
+cp -r /usr/local/analysis/augustus/3.3.2/config ~/augustus/config
+export AUGUSTUS_CONFIG_PATH="/home/wileyg/augustus/config/"
+sbatch -p highmem -t 0-72 --mem 128 -c 36 --mail-type=END,FAIL --mail-user wileyg@omrf.org -J busco_pilon2 --wrap "run_BUSCO.py -i ./pilon2_dir/all_pilon2_polished.fasta   -o busco_pilon2 -l /s/cgc/20190726_Miller_Nanopore/busco/aves_odb9/ -m genome -c 36 -sp chicken -f --restart"
